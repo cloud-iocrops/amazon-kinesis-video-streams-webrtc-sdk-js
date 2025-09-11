@@ -19,9 +19,9 @@ const DEFAULT_CODECS = {
 function configureLogging() {
     function log(level, messages) {
         const text = messages
-            .map(message => {
+            .map((message) => {
                 if (message instanceof Error) {
-                    const {stack, ...rest} = message;
+                    const { stack, ...rest } = message;
                     if (Object.keys(rest).length === 0) {
                         if (stack) {
                             return stack;
@@ -75,10 +75,7 @@ function configureLogging() {
 }
 
 function getRandomClientId() {
-    return Math.random()
-        .toString(36)
-        .substring(2)
-        .toUpperCase();
+    return Math.random().toString(36).substring(2).toUpperCase();
 }
 
 function getFormValues() {
@@ -212,7 +209,7 @@ $('#master-button').click(async () => {
 
     printFormValues(formValues);
 
-    startMaster(localView, remoteView, formValues, onStatsReport, event => {
+    startMaster(localView, remoteView, formValues, onStatsReport, (event) => {
         remoteMessage.append(`${event.data}\n`);
     });
 });
@@ -240,7 +237,8 @@ $('#viewer-button').click(async () => {
     const formValues = getFormValues();
 
     if (formValues.autoDetermineMediaIngestMode) {
-        channelHelper = new ChannelHelper(formValues.channelName,
+        channelHelper = new ChannelHelper(
+            formValues.channelName,
             {
                 region: formValues.region,
                 credentials: {
@@ -254,7 +252,8 @@ $('#viewer-button').click(async () => {
             ChannelHelper.IngestionMode.DETERMINE_THROUGH_DESCRIBE,
             '[VIEWER]',
             formValues.clientId,
-            formValues.logAwsSdkCalls ? console : undefined);
+            formValues.logAwsSdkCalls ? console : undefined,
+        );
         await channelHelper.determineMediaIngestionPath();
 
         if (channelHelper.isIngestionEnabled()) {
@@ -355,18 +354,18 @@ async function logLevelSelected(event) {
 
 // Fetch regions
 fetch('https://api.regional-table.region-services.aws.a2z.com/index.jsons')
-    .then(res => {
+    .then((res) => {
         if (res.ok) {
             return res.json();
         }
         return Promise.reject(`${res.status}: ${res.statusText}`);
     })
-    .then(data => {
+    .then((data) => {
         data?.prices
-            ?.filter(serviceData => serviceData?.attributes['aws:serviceName'] === 'Amazon Kinesis Video Streams')
-            .map(kinesisVideoServiceData => kinesisVideoServiceData?.attributes['aws:region'])
+            ?.filter((serviceData) => serviceData?.attributes['aws:serviceName'] === 'Amazon Kinesis Video Streams')
+            .map((kinesisVideoServiceData) => kinesisVideoServiceData?.attributes['aws:region'])
             .sort()
-            .forEach(region => {
+            .forEach((region) => {
                 $('#regionList').append(
                     $('<option>', {
                         value: region,
@@ -377,12 +376,12 @@ fetch('https://api.regional-table.region-services.aws.a2z.com/index.jsons')
         $('#region').attr('list', 'regionList');
         console.log('[FETCH-REGIONS] Successfully fetched regions!');
     })
-    .catch(err => {
+    .catch((err) => {
         console.error('[FETCH-REGIONS] Encountered error fetching regions', err);
     });
 
 // Region verification
-$('#region').on('focusout', event => {
+$('#region').on('focusout', (event) => {
     const region = event.target.value;
     let found = false;
     let anyRegions = false;
@@ -425,9 +424,9 @@ function addViewerMediaStreamToMaster(viewerId, track) {
         ?.remove();
 
     const container = $(`<div id="${viewerId}"></div>`);
-    const video = viewerId?.length ?
-        $(`<video autoPlay playsInline controls title="${viewerId}"></video>`) :
-        $('<video autoPlay playsInline controls></video>');
+    const video = viewerId?.length
+        ? $(`<video autoPlay playsInline controls title="${viewerId}"></video>`)
+        : $('<video autoPlay playsInline controls></video>');
     video.addClass('remote-view');
     container.append(video);
 
@@ -460,7 +459,7 @@ async function printPeerConnectionStateInfo(event, logPrefix, remoteClientId) {
         const stats = await rtcPeerConnection.getStats();
         if (!stats) return;
 
-        rtcPeerConnection.getSenders().map(sender => {
+        rtcPeerConnection.getSenders().map((sender) => {
             const trackType = sender.track?.kind;
             if (sender.transport) {
                 const iceTransport = sender.transport.iceTransport;
@@ -527,53 +526,53 @@ $('#ingest-media-manual-off').click(() => {
 // Read/Write all of the fields to/from localStorage so that fields are not lost on refresh.
 const urlParams = new URLSearchParams(window.location.search);
 const fields = [
-    {field: 'channelName', type: 'text'},
-    {field: 'clientId', type: 'text'},
-    {field: 'region', type: 'text'},
-    {field: 'accessKeyId', type: 'text'},
-    {field: 'secretAccessKey', type: 'text'},
-    {field: 'sessionToken', type: 'text'},
-    {field: 'endpoint', type: 'text'},
-    {field: 'sendVideo', type: 'checkbox'},
-    {field: 'sendAudio', type: 'checkbox'},
-    {field: 'streamName', type: 'text'},
-    {field: 'ingest-media', type: 'checkbox'},
-    {field: 'ingest-media-manual-on', type: 'button'},
-    {field: 'ingest-media-manual-off', type: 'button'},
-    {field: 'show-join-storage-session-button', type: 'checkbox'},
-    {field: 'show-join-storage-session-as-viewer-button', type: 'checkbox'},
-    {field: 'widescreen', type: 'radio', name: 'resolution'},
-    {field: 'fullscreen', type: 'radio', name: 'resolution'},
-    {field: 'openDataChannel', type: 'checkbox'},
-    {field: 'useTrickleICE', type: 'checkbox'},
-    {field: 'natTraversalEnabled', type: 'radio', name: 'natTraversal'},
-    {field: 'forceSTUN', type: 'radio', name: 'natTraversal'},
-    {field: 'forceTURN', type: 'radio', name: 'natTraversal'},
-    {field: 'natTraversalDisabled', type: 'radio', name: 'natTraversal'},
-    {field: 'enableDQPmetrics', type: 'checkbox'},
-    {field: 'enableProfileTimeline', type: 'checkbox'},
-    {field: 'send-host', type: 'checkbox'},
-    {field: 'accept-host', type: 'checkbox'},
-    {field: 'send-relay', type: 'checkbox'},
-    {field: 'accept-relay', type: 'checkbox'},
-    {field: 'send-srflx', type: 'checkbox'},
-    {field: 'accept-srflx', type: 'checkbox'},
-    {field: 'send-prflx', type: 'checkbox'},
-    {field: 'accept-prflx', type: 'checkbox'},
-    {field: 'send-tcp', type: 'checkbox'},
-    {field: 'accept-tcp', type: 'checkbox'},
-    {field: 'send-udp', type: 'checkbox'},
-    {field: 'accept-udp', type: 'checkbox'},
-    {field: 'signaling-reconnect', type: 'checkbox'},
-    {field: 'log-aws-sdk-calls', type: 'checkbox'},
-    {field: 'codec-filter-toggle', type: 'checkbox'},
-    {field: 'turn-with-udp', type: 'checkbox'},
-    {field: 'turns-with-udp', type: 'checkbox'},
-    {field: 'turns-with-tcp', type: 'checkbox'},
-    {field: 'turn-one-set-only', type: 'checkbox'},
+    { field: 'channelName', type: 'text' },
+    { field: 'clientId', type: 'text' },
+    { field: 'region', type: 'text' },
+    { field: 'accessKeyId', type: 'text' },
+    { field: 'secretAccessKey', type: 'text' },
+    { field: 'sessionToken', type: 'text' },
+    { field: 'endpoint', type: 'text' },
+    { field: 'sendVideo', type: 'checkbox' },
+    { field: 'sendAudio', type: 'checkbox' },
+    { field: 'streamName', type: 'text' },
+    { field: 'ingest-media', type: 'checkbox' },
+    { field: 'ingest-media-manual-on', type: 'button' },
+    { field: 'ingest-media-manual-off', type: 'button' },
+    { field: 'show-join-storage-session-button', type: 'checkbox' },
+    { field: 'show-join-storage-session-as-viewer-button', type: 'checkbox' },
+    { field: 'widescreen', type: 'radio', name: 'resolution' },
+    { field: 'fullscreen', type: 'radio', name: 'resolution' },
+    { field: 'openDataChannel', type: 'checkbox' },
+    { field: 'useTrickleICE', type: 'checkbox' },
+    { field: 'natTraversalEnabled', type: 'radio', name: 'natTraversal' },
+    { field: 'forceSTUN', type: 'radio', name: 'natTraversal' },
+    { field: 'forceTURN', type: 'radio', name: 'natTraversal' },
+    { field: 'natTraversalDisabled', type: 'radio', name: 'natTraversal' },
+    { field: 'enableDQPmetrics', type: 'checkbox' },
+    { field: 'enableProfileTimeline', type: 'checkbox' },
+    { field: 'send-host', type: 'checkbox' },
+    { field: 'accept-host', type: 'checkbox' },
+    { field: 'send-relay', type: 'checkbox' },
+    { field: 'accept-relay', type: 'checkbox' },
+    { field: 'send-srflx', type: 'checkbox' },
+    { field: 'accept-srflx', type: 'checkbox' },
+    { field: 'send-prflx', type: 'checkbox' },
+    { field: 'accept-prflx', type: 'checkbox' },
+    { field: 'send-tcp', type: 'checkbox' },
+    { field: 'accept-tcp', type: 'checkbox' },
+    { field: 'send-udp', type: 'checkbox' },
+    { field: 'accept-udp', type: 'checkbox' },
+    { field: 'signaling-reconnect', type: 'checkbox' },
+    { field: 'log-aws-sdk-calls', type: 'checkbox' },
+    { field: 'codec-filter-toggle', type: 'checkbox' },
+    { field: 'turn-with-udp', type: 'checkbox' },
+    { field: 'turns-with-udp', type: 'checkbox' },
+    { field: 'turns-with-tcp', type: 'checkbox' },
+    { field: 'turn-one-set-only', type: 'checkbox' },
 ];
 
-fields.forEach(({field, type, name}) => {
+fields.forEach(({ field, type, name }) => {
     const id = '#' + field;
 
     // Read field from localStorage
@@ -626,8 +625,8 @@ fields.forEach(({field, type, name}) => {
                 localStorage.setItem(field, $(id).is(':checked'));
             } else if (type === 'radio') {
                 fields
-                    .filter(fieldItem => fieldItem.name === name)
-                    .forEach(fieldItem => {
+                    .filter((fieldItem) => fieldItem.name === name)
+                    .forEach((fieldItem) => {
                         localStorage.setItem(fieldItem.field, fieldItem.field === field);
                     });
             } else if (type === 'text') {
@@ -650,7 +649,7 @@ fields.forEach(({field, type, name}) => {
  * @returns true if the candidate should be added to the peerConnection.
  */
 function shouldAcceptCandidate(formValues, candidate) {
-    const {transport, type} = extractTransportAndType(candidate);
+    const { transport, type } = extractTransportAndType(candidate);
 
     if (!formValues.acceptUdpCandidates && transport === 'udp') {
         return false;
@@ -745,7 +744,7 @@ function saveAdvanced() {
  * @returns true if the candidate should be sent to the peer.
  */
 function shouldSendIceCandidate(formValues, candidate) {
-    const {transport, type} = extractTransportAndType(candidate);
+    const { transport, type } = extractTransportAndType(candidate);
 
     if (!formValues.sendUdpCandidates && transport === 'udp') {
         return false;
@@ -783,7 +782,7 @@ function extractTransportAndType(candidate) {
     }
 
     // https://datatracker.ietf.org/doc/html/rfc5245#section-15.1
-    return {transport: words[2], type: words[7]};
+    return { transport: words[2], type: words[7] };
 }
 
 $('#copy-logs').on('click', async function () {
@@ -799,7 +798,7 @@ $('#copy-logs').on('click', async function () {
     $('#copy-tooltip').tooltip('show');
     $('#copy-logs').removeClass('btn-light');
     $('#copy-logs').addClass('btn-success');
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 1000));
     $('#copy-tooltip').tooltip('hide');
     $('#copy-logs').removeClass('btn-success');
     $('#copy-logs').addClass('btn-light');
@@ -865,7 +864,7 @@ $(document).ready(function () {
     $('[data-toggle="tooltip"]').tooltip();
 
     // Except the copy-logs tooltip
-    $('#copy-tooltip').tooltip({trigger: 'manual'});
+    $('#copy-tooltip').tooltip({ trigger: 'manual' });
 });
 
 function saveCodecPreferences() {
@@ -884,10 +883,14 @@ function saveCodecPreferences() {
     localStorage.setItem('audioCodecs', JSON.stringify(audioCodecs));
 
     /** @type {string[]} */
-    const selectedVideoMimeTypes = Array.from($('input[name="vcodec"]:checked')).map((selectElement) => $(selectElement).val()).sort();
+    const selectedVideoMimeTypes = Array.from($('input[name="vcodec"]:checked'))
+        .map((selectElement) => $(selectElement).val())
+        .sort();
 
     /** @type {string[]} */
-    const selectedAudioMimeTypes = Array.from($('input[name="acodec"]:checked')).map((selectElement) => $(selectElement).val()).sort();
+    const selectedAudioMimeTypes = Array.from($('input[name="acodec"]:checked'))
+        .map((selectElement) => $(selectElement).val())
+        .sort();
 
     $('#reset-codecs').prop(
         'disabled',
@@ -918,11 +921,11 @@ function loadCodecPreferences() {
 }
 
 async function resetCodecPreferences() {
-    $('input[name="vcodec"]').each(function() {
+    $('input[name="vcodec"]').each(function () {
         $(this).prop('checked', DEFAULT_CODECS.video.includes($(this).val()));
     });
 
-    $('input[name="acodec"]').each(function() {
+    $('input[name="acodec"]').each(function () {
         $(this).prop('checked', DEFAULT_CODECS.audio.includes($(this).val()));
     });
 
