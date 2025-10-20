@@ -1,4 +1,19 @@
 <h1 align="center">
+    실행 가이드
+    <br />
+</h1>
+1. git clone amazon-kinesis-video-streams-webrtc-sdk-js
+<br />
+2. npm install (pnpm 또는 yarn도 동일하게 패키지 설치 필요)
+<br />
+3. npm run develop
+<br />
+4. localhost:3001 > Region(ap-northeast-2), AWS credentials, Signaling Channel - Channel Name 입력
+<br />
+5. 하단 Start Viewer 실행
+
+
+<h1 align="center">
     Amazon Kinesis Video Streams WebRTC SDK for JavaScript
     <br />
 </h1>
