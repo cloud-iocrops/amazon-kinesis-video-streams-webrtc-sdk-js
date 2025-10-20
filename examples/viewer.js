@@ -44,6 +44,246 @@ let timeToSetUpViewerMedia = 0;
 let timeToFirstFrameFromOffer = 0;
 let timeToFirstFrameFromViewerStart = 0;
 
+// ===== Adaptive Latency / Drop Control (Viewer side) =====
+// Thresholds can be tuned based on empirical observation.
+const DROP_RATE_THRESHOLD = 15; // % current interval drop rate considered high
+const DROP_CONSECUTIVE_MAX = 5; // consecutive intervals before hard action
+const RENDER_LATENCY_THRESHOLD_MS = 140; // composite latency (decode+render) threshold
+let _consecutiveHighDrop = 0;
+let _consecutiveHighRender = 0;
+// Last measured composite parts
+viewer._lastRenderingDelay = 0; // from calcStats (decode + processing + jitterBuffer)
+viewer._renderLatencyMs = 0; // from requestVideoFrameCallback
+// 추가 렌더링 최적화 상태 저장
+viewer._longTasksTotal = 0;
+viewer._longTasksWindowStart = performance.now();
+viewer._longTaskObserverStarted = false;
+viewer._videoElementOptimized = false;
+viewer._videoSized = false;
+viewer._lastRafTime = performance.now();
+viewer._mainThreadBlockMs = 0; // 최근 프레임 간 추정 블로킹
+
+function startLongTaskObserver() {
+    if (viewer._longTaskObserverStarted) return;
+    if (typeof PerformanceObserver === 'undefined') return;
+    try {
+        const obs = new PerformanceObserver((list) => {
+            const entries = list.getEntries();
+            for (const e of entries) {
+                viewer._longTasksTotal += e.duration;
+            }
+        });
+        obs.observe({ entryTypes: ['longtask'] });
+        viewer._longTaskObserverStarted = true;
+        viewer._longTaskObserver = obs;
+    } catch (_) {}
+}
+
+function optimizeVideoElement(el) {
+    if (!el || viewer._videoElementOptimized) return;
+    // 합성 레이어 분리 및 레이아웃/페인트 비용 절감 시도
+    try {
+        el.style.willChange = 'transform';
+    } catch (_) {}
+    try {
+        el.style.transform = 'translateZ(0)';
+    } catch (_) {}
+    try {
+        el.style.objectFit = 'contain';
+    } catch (_) {}
+    try {
+        el.style.backfaceVisibility = 'hidden';
+    } catch (_) {}
+    try {
+        el.style.contain = 'layout style paint';
+    } catch (_) {}
+    // Picture-in-Picture / Controls 비활성화로 이벤트/레이아웃 간섭 감소
+    try {
+        el.controls = false;
+    } catch (_) {}
+    try {
+        el.disablePictureInPicture = true;
+    } catch (_) {}
+    viewer._videoElementOptimized = true;
+}
+
+function attachRenderLatencyMonitor(videoEl) {
+    if (!videoEl || viewer._renderLatencyMonitorAttached) return;
+    viewer._renderLatencyMonitorAttached = true;
+    // 최근 프레임 렌더 지연 샘플 보관 (이동 평균/백분위 계산용)
+    viewer._renderLatencySamples = [];
+    viewer._renderLatencySampleLimit = 120; // 약 2초@60fps 혹은 4초@30fps
+    viewer._lastRenderStatsLogTs = 0; // 출력 스로틀
+    if (typeof videoEl.requestVideoFrameCallback === 'function') {
+        const cb = (now, metadata) => {
+            let base = metadata?.expectedDisplayTime ?? now;
+            let renderLatency = now - base;
+            if (renderLatency < 0) renderLatency = 0;
+            viewer._renderLatencyMs = renderLatency;
+            viewer._renderLatencySamples.push(renderLatency);
+            if (viewer._renderLatencySamples.length > viewer._renderLatencySampleLimit) {
+                viewer._renderLatencySamples.shift();
+            }
+            evaluateAdapt();
+            videoEl.requestVideoFrameCallback(cb);
+        };
+        videoEl.requestVideoFrameCallback(cb);
+    } else {
+        // Fallback: frame interval approximation (less accurate)
+        let prev = performance.now();
+        function loop() {
+            const now = performance.now();
+            viewer._renderLatencyMs = now - prev;
+            prev = now;
+            // 메인쓰레드 블로킹 추정: rAF 간격이 target(16.7ms @60fps)보다 크면 초과분 누적
+            const gap = now - viewer._lastRafTime;
+            const expected = 16.7; // 대략 60fps 기준
+            if (gap > expected) {
+                viewer._mainThreadBlockMs = gap - expected;
+            } else {
+                viewer._mainThreadBlockMs = 0;
+            }
+            viewer._lastRafTime = now;
+            evaluateAdapt();
+            requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+    }
+}
+
+function pseudoJumpToLive() {
+    const v = viewer.remoteView;
+    if (!v) return;
+    // 조건: 최근 1초 동안 framesDecoded 증가했지만 requestVideoFrameCallback 기반 renderLatencySamples 모두 임계 초과 OR lastVideoFrameTime 정체
+    if (viewer._renderLatencySamples && viewer._renderLatencySamples.length > 10) {
+        const samples = viewer._renderLatencySamples.slice(-30); // 최근 부분
+        const badSamples = samples.filter((s) => s > RENDER_LATENCY_THRESHOLD_MS * 1.2).length; // 약간 높은 기준
+        const allBad = badSamples === samples.length;
+        // lastVideoFrameTime 갱신 정체 감지 (최근 측정 시각과 현재 차이가 크면)
+        const nowPerf = performance.now();
+        const stalled = nowPerf - (viewer._lastVideoFramePerfTs || nowPerf) > 800; // 0.8초 이상 프레임 없음
+        if (!allBad && !stalled) {
+            console.warn('[VIEWER] pseudoJumpToLive skipped (no stall condition)');
+            return;
+        }
+    }
+    console.warn('[VIEWER] pseudoJumpToLive triggered');
+    try {
+        v.pause();
+        v.play().catch(() => {});
+        if (viewer.remoteStream) {
+            viewer.remoteStream.getVideoTracks().forEach((t) => {
+                t.enabled = false;
+                setTimeout(() => (t.enabled = true), 0);
+            });
+        }
+        const s = v.srcObject;
+        v.srcObject = null;
+        v.srcObject = s;
+    } catch (e) {
+        console.warn('pseudoJumpToLive failed', e);
+    }
+}
+
+function sendAdaptMessage(reason, extra = {}) {
+    if (!viewer.dataChannel) return;
+    try {
+        viewer.dataChannel.send(
+            JSON.stringify({
+                type: 'ADAPT_LOWER_QUALITY',
+                reason,
+                ...extra,
+            }),
+        );
+        console.warn('[VIEWER] Sent ADAPT_LOWER_QUALITY reason=' + reason);
+    } catch (e) {
+        console.warn('sendAdaptMessage failed', e);
+    }
+}
+
+function evaluateAdapt() {
+    const renderLatency = viewer._renderLatencyMs || 0;
+    const decodeLatency = viewer._lastRenderingDelay || 0;
+    const compositeLatency = Math.max(renderLatency, decodeLatency);
+
+    // 이동 평균 및 95p 계산
+    let avg = renderLatency;
+    let p95 = renderLatency;
+    if (viewer._renderLatencySamples && viewer._renderLatencySamples.length > 5) {
+        const arr = viewer._renderLatencySamples.slice();
+        arr.sort((a, b) => a - b);
+        avg = arr.reduce((acc, v) => acc + v, 0) / arr.length;
+        p95 = arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.95))];
+    }
+
+    // 동적 playoutDelayHint 조정 (하향 혹은 상향)
+    if (viewer.peerConnection && viewer.peerConnection.getReceivers) {
+        const targetBase = 0.06; // 60ms 기본 목표
+        const receivers = viewer.peerConnection.getReceivers();
+        receivers.forEach((r) => {
+            if ('playoutDelayHint' in r) {
+                try {
+                    let currentHint = r.playoutDelayHint;
+                    if (typeof currentHint !== 'number') currentHint = targetBase;
+                    // 평균 렌더링 지연이 목표보다 낮고 힌트가 높으면 조금 줄이기
+                    if (avg < RENDER_LATENCY_THRESHOLD_MS * 0.5 && currentHint > 0.045) {
+                        r.playoutDelayHint = Math.max(0.04, currentHint - 0.005);
+                    } else if (p95 > RENDER_LATENCY_THRESHOLD_MS && currentHint < 0.12) {
+                        // 최악(95p)이 임계 초과시 약간 증가하여 프레임 드롭 방지
+                        r.playoutDelayHint = Math.min(0.12, currentHint + 0.008);
+                    }
+                } catch (e) {}
+            }
+        });
+    }
+
+    if (compositeLatency > RENDER_LATENCY_THRESHOLD_MS) {
+        _consecutiveHighRender++;
+    } else {
+        _consecutiveHighRender = 0;
+    }
+
+    if (_consecutiveHighRender === DROP_CONSECUTIVE_MAX) {
+        pseudoJumpToLive();
+    } else if (_consecutiveHighRender > DROP_CONSECUTIVE_MAX + 1) {
+        sendAdaptMessage('HIGH_RENDER_LATENCY', {
+            renderLatencyMs: renderLatency,
+            decodeLatencyMs: decodeLatency,
+            thresholdMs: RENDER_LATENCY_THRESHOLD_MS,
+        });
+        _consecutiveHighRender = 0;
+    }
+    // Drop rate handled in calcStats after curDropPercent computed.
+}
+
+function applyLowLatencyHints() {
+    const v = viewer.remoteView;
+    if (v) {
+        try {
+            v.latencyHint = 'interactive';
+        } catch (e) {}
+        try {
+            v.contentHint = 'motion';
+        } catch (e) {}
+        // 추가 하드웨어 디코더 최적화 힌트
+        try {
+            // 하드웨어 가속 디코딩 강제 시도
+            v.setAttribute('playsinline', '');
+            v.setAttribute('webkit-playsinline', '');
+        } catch (e) {}
+    }
+    if (viewer.peerConnection) {
+        viewer.peerConnection.getReceivers().forEach((r) => {
+            if ('playoutDelayHint' in r) {
+                try {
+                    // 더 낮은 playout delay 목표 (40ms)로 jitter buffer 최소화
+                    r.playoutDelayHint = 0.04;
+                } catch (e) {}
+            }
+        });
+    }
+}
+
 let metrics = {
     viewer: {
         waitTime: {
@@ -840,6 +1080,13 @@ async function startViewer(localView, remoteView, formValues, onStatsReport, rem
             viewer.remoteStream = event.streams[0];
             remoteView.srcObject = viewer.remoteStream;
 
+            viewer.remoteView.autoplay = true;
+            viewer.remoteView.playsInline = true;
+
+            // MediaStream은 buffered 범위 의미 없음 -> 이전 점프 로직 제거.
+            startFrameTracking(); // 내부 프레임 타임스탬프 추적
+            applyLowLatencyHints(); // latency/content 힌트 적용
+            attachRenderLatencyMonitor(viewer.remoteView); // 실제 렌더링 지연 수집
             //measure the time to first track
             if (formValues.enableDQPmetrics && initialDate === 0) {
                 initialDate = new Date();
@@ -911,6 +1158,11 @@ function stopViewer() {
             headerElement.textContent = '';
         }
 
+        if (viewer._bufferInterval) {
+            clearInterval(viewer._bufferInterval);
+            viewer._bufferInterval = null;
+        }
+
         viewer = {};
     } catch (e) {
         console.error('[VIEWER] Encountered error stopping', e);
@@ -948,15 +1200,35 @@ function calcDiffTimestamp2Sec(large, small) {
     return ((large - small) / 1000).toFixed(2);
 }
 
-// 브라우저에 실제 렌더링된 시간
+// 브라우저에 실제 렌더링된 시간 (가장 최근 프레임 렌더 시점의 performance.now())
 let lastVideoFrameTime = 0;
+function startFrameTracking() {
+    if (viewer._frameTrackingStarted) return;
+    if (!viewer.remoteView) return;
+    viewer._frameTrackingStarted = true;
+    startLongTaskObserver();
+    optimizeVideoElement(viewer.remoteView);
+    function trackFrameUpdates() {
+        lastVideoFrameTime = performance.now();
+        viewer._lastVideoFramePerfTs = lastVideoFrameTime;
+        // rAF 지연 기반 메인쓰레드 블로킹 추정 (requestVideoFrameCallback 미지원 브라우저 대비)
+        const gap = lastVideoFrameTime - viewer._lastRafTime;
+        viewer._lastRafTime = lastVideoFrameTime;
+        const expected = 16.7;
+        if (gap > expected) {
+            viewer._mainThreadBlockMs = gap - expected;
+        } else {
+            viewer._mainThreadBlockMs = 0;
+        }
+        requestAnimationFrame(trackFrameUpdates);
+    }
+    requestAnimationFrame(trackFrameUpdates);
+}
 
 function calcStats(stats, clientId) {
     let rttCurrent = 0;
 
-    let videoLatency = 0;
-    let packetReceiveTime = 0;
-    let browserRenderTime = 0;
+    // Removed unused placeholders: videoLatency, packetReceiveTime, browserRenderTime
 
     let videoBitrate = 0;
     let videoFramerate = 0;
@@ -977,14 +1249,10 @@ function calcStats(stats, clientId) {
     let localCandidateConnectionString = '';
     let htmlString = '';
 
-    viewer.remoteView.addEventListener('loadeddata', () => {
-        // 비디오가 로드되면 프레임 업데이트 추적 시작
-        function trackFrameUpdates() {
-            lastVideoFrameTime = performance.now();
-            requestAnimationFrame(trackFrameUpdates);
-        }
-        trackFrameUpdates();
-    });
+    let framesDecoded = 0; // will assign from inbound-rtp video
+    let videoLatency = 0;
+
+    // 프레임 트래킹은 remote track 수신 시 startFrameTracking() 으로 1회만 시작.
 
     stats.forEach((report) => {
         if (report.type === 'transport') {
@@ -1009,6 +1277,18 @@ function calcStats(stats, clientId) {
             // activeCandidatePair 체크를 제거하거나 로그 추가
             console.log('activeCandidatePair:', activeCandidatePair);
             console.log('lastPacketTime:', lastPacketTime);
+            console.log(report);
+            // framesDecodedLocalInitial removed (unused)
+            framesDecoded = report.framesDecoded || 0;
+            const framesDropped = report.framesDropped || 0;
+            let dropPercent = 0;
+            if (framesDecoded + framesDropped > 0) {
+                dropPercent = (framesDropped / (framesDecoded + framesDropped)) * 100;
+            }
+            console.log(`🖼️ 프레임 드랍핑:`);
+            console.log(`- 디코딩된 프레임: ${framesDecoded}`);
+            console.log(`- 드랍된 프레임: ${framesDropped}`);
+            console.log(`- 드랍률: ${dropPercent.toFixed(2)}%`);
 
             if (lastPacketTime) {
                 // activeCandidatePair 조건 제거
@@ -1019,28 +1299,53 @@ function calcStats(stats, clientId) {
                 // 나머지 계산...
                 const jitter = report.jitter ? report.jitter * 1000 : 0;
                 const totalDecodeTime = report.totalDecodeTime || 0;
-                const framesDecoded = report.framesDecoded || 1;
-                const actualRenderingDelay = (totalDecodeTime / framesDecoded) * 1000;
+                const framesDecodedLocal = report.framesDecoded || 1;
+                const actualRenderingDelay = (totalDecodeTime / framesDecodedLocal) * 1000;
                 const packetProcessingDelay = report.totalProcessingDelay || 0;
+                const jitterBufferDelay = report.jitterBufferDelay || 0; // seconds cumulative
+                const jitterBufferEmittedCount = report.jitterBufferEmittedCount || 0;
+                let avgJitterBufferPlayoutDelayMs = 0;
+                if (jitterBufferEmittedCount > 0) {
+                    avgJitterBufferPlayoutDelayMs = (jitterBufferDelay / jitterBufferEmittedCount) * 1000;
+                }
 
                 const networkLatency = actualNetworkLatency;
-                const renderingLatency = actualRenderingDelay + packetProcessingDelay;
+                const renderingLatency = actualRenderingDelay + packetProcessingDelay + avgJitterBufferPlayoutDelayMs;
                 const totalLatency = networkLatency + renderingLatency + jitter;
+                viewer._lastRenderingDelay = renderingLatency;
 
                 const currentTime = new Date();
                 const timeStr = currentTime.toLocaleTimeString('ko-KR');
 
-                console.log(`┌─────────────────────────────────────────────────────┐`);
-                console.log(`│                실제 측정된 지연시간                    │`);
-                console.log(`├─────────────────────────────────────────────────────┤`);
-                console.log(`│ 🌐 실제 네트워크 지연: ${networkLatency.toFixed(1).padStart(6)}ms            │`);
-                console.log(`│ 🖼️ 실제 렌더링 지연:   ${renderingLatency.toFixed(1).padStart(6)}ms            │`);
-                console.log(`│ 📊 네트워크 지터:     ${jitter.toFixed(1).padStart(6)}ms            │`);
-                console.log(`│ ⏱️ 총 지연시간:       ${totalLatency.toFixed(1).padStart(6)}ms            │`);
-                console.log(`│ 📈 RTT:              ${rtt.toFixed(1).padStart(6)}ms            │`);
-                console.log(`│ 🎬 디코딩된 프레임:    ${framesDecoded.toString().padStart(6)}개             │`);
-                console.log(`│ 🕐 측정 시간:         ${timeStr}                      │`);
-                console.log(`└─────────────────────────────────────────────────────┘`);
+                const nowPerf = performance.now();
+                const lastLog = viewer._lastRenderStatsLogTs || 0;
+                const prevLatency = viewer._prevTotalLatency || totalLatency;
+                const diff = Math.abs(prevLatency - totalLatency);
+                if (nowPerf - lastLog > 3000 || diff > 40) {
+                    viewer._lastRenderStatsLogTs = nowPerf;
+                    viewer._prevTotalLatency = totalLatency;
+                    console.log(`┌─────────────────────────────────────────────────────┐`);
+                    console.log(`│                실제 측정된 지연시간                    │`);
+                    console.log(`├─────────────────────────────────────────────────────┤`);
+                    console.log(`│ 🌐 실제 네트워크 지연: ${networkLatency.toFixed(1).padStart(6)}ms            │`);
+                    console.log(`│ 🖼️ 실제 렌더링 지연:   ${renderingLatency.toFixed(1).padStart(6)}ms            │`);
+                    console.log(`│ 📊 네트워크 지터:     ${jitter.toFixed(1).padStart(6)}ms            │`);
+                    console.log(`│ 🧵 메인쓰레드 블로킹:  ${viewer._mainThreadBlockMs.toFixed(1).padStart(6)}ms            │`);
+                    const longTaskWindowMs = nowPerf - viewer._longTasksWindowStart;
+                    if (longTaskWindowMs > 5000) {
+                        // 5초 윈도우 재계산
+                        viewer._longTasksWindowStart = nowPerf;
+                        viewer._longTasksTotal = 0;
+                    }
+                    console.log(`│ ⌛ LongTask 누적(윈도우): ${viewer._longTasksTotal.toFixed(1).padStart(6)}ms / ${Math.round(longTaskWindowMs)}ms  │`);
+                    console.log(`│ ⏱️ 총 지연시간:       ${totalLatency.toFixed(1).padStart(6)}ms            │`);
+                    console.log(`│ 📈 RTT:              ${rtt.toFixed(1).padStart(6)}ms            │`);
+                    console.log(`│ 🎬 디코딩된 프레임:    ${framesDecoded.toString().padStart(6)}개             │`);
+                    console.log(`│ 🖥️ 화면 렌더 지연(ms): ${(viewer._renderLatencyMs || 0).toFixed(1).padStart(6)}             │`);
+                    console.log(`│ 🔁 디코더+버퍼 지연(ms): ${(viewer._lastRenderingDelay || 0).toFixed(1).padStart(6)}             │`);
+                    console.log(`│ 🕐 측정 시간:         ${timeStr}                      │`);
+                    console.log(`└─────────────────────────────────────────────────────┘`);
+                }
 
                 videoLatency = totalLatency;
             }
@@ -1111,6 +1416,14 @@ function calcStats(stats, clientId) {
                 videojitter = report.jitter;
                 videoDecodedFrameCount = report.framesDecoded;
                 videoDroppedFrameCount = report.framesDropped;
+                // 비디오 엘리먼트 사이즈를 실제 프레임 해상도에 맞춰 1회 설정 (과도한 스케일 방지)
+                if (!viewer._videoSized && viewer.remoteView && videoWidth && videoHeight) {
+                    try {
+                        viewer.remoteView.width = videoWidth;
+                        viewer.remoteView.height = videoHeight;
+                    } catch (_) {}
+                    viewer._videoSized = true;
+                }
 
                 const bytes = report.bytesReceived;
                 if (vTimeStampPrev) {
@@ -1162,6 +1475,23 @@ function calcStats(stats, clientId) {
 
             // Calculate dropped frame percentage
             let curDropPercent = (curDroppedFrames / (curDroppedFrames + videoFramerate)) * 100;
+            // Drop adaptation tracking
+            if (!isNaN(curDropPercent)) {
+                if (curDropPercent > DROP_RATE_THRESHOLD) {
+                    _consecutiveHighDrop++;
+                } else {
+                    _consecutiveHighDrop = 0;
+                }
+                if (_consecutiveHighDrop === DROP_CONSECUTIVE_MAX) {
+                    pseudoJumpToLive();
+                } else if (_consecutiveHighDrop > DROP_CONSECUTIVE_MAX + 1) {
+                    sendAdaptMessage('HIGH_DROP_RATE', {
+                        dropRatePercent: curDropPercent.toFixed(2),
+                        thresholdPercent: DROP_RATE_THRESHOLD,
+                    });
+                    _consecutiveHighDrop = 0;
+                }
+            }
 
             if (typeof curDropPercent === 'undefined' || isNaN(curDropPercent)) {
                 // force to 100% if there are gaps in the stream
